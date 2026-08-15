@@ -1,0 +1,3 @@
+PENTING:
+Folder ini berisi database utama SQLite Aplikasi Perpustakaan SMK Walisongo.
+Menghapus atau mengubah isi folder ini akan merusak sistem.
