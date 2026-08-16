@@ -16,6 +16,10 @@ from tkinter import messagebox, ttk, simpledialog, filedialog
 # Import ReportLab & Pillow untuk Cetak PDF
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 from PIL import Image, ImageDraw, ImageFont
 
 # =====================================================================
@@ -164,12 +168,10 @@ class AplikasiPerpusTerintegrasi:
                 jumlah_baris = 0
             
             if jumlah_baris > 0:
-                print(f"ℹ️ [MIGRATION] Tabel '{nama_tabel}' sudah terisi ({jumlah_baris} baris). Memproses data SQLite aktif...")
                 continue
             
             if os.path.exists(path_excel):
                 file_name = os.path.basename(path_excel)
-                print(f"🔄 Mengimpor data awal dari '{file_name}' ke tabel '{nama_tabel}'...")
                 try:
                     if nama_tabel == "qr_id_buku":
                         df_lama = pd.read_excel(path_excel, header=None, dtype=str)
@@ -189,12 +191,9 @@ class AplikasiPerpusTerintegrasi:
                         df_lama = df_lama.drop_duplicates(subset=["label_buku"], keep='first')
                     
                     df_lama.to_sql(nama_tabel, conn, if_exists="append", index=False)
-                    print(f"✅ [MIGRATION] Impor awal {file_name} sukses!")
-                    
                     waktu_sekarang = datetime.now().strftime("%Y%m%d_%H%M%S")
                     os.makedirs(folder_arsip, exist_ok=True)
                     shutil.move(path_excel, os.path.join(folder_arsip, f"Migrated_{waktu_sekarang}_{file_name}"))
-                    
                 except Exception as e:
                     print(f"❌ [MIGRATION ERROR] Gagal konversi {file_name}: {e}")
                     
@@ -284,6 +283,15 @@ class AplikasiPerpusTerintegrasi:
         s = str(val).strip().split('.')[0]
         return s.lstrip('0')
 
+    def ekstrak_kode_induk(self, kode_lengkap):
+        """Membuang 3 digit eksemplar terakhir dari kode buku (Format Induk)"""
+        kode = str(kode_lengkap).strip()
+        if '-' in kode:
+            bagian = kode.split('-')
+            if len(bagian[-1]) >= 1 and bagian[-1].isdigit():
+                return '-'.join(bagian[:-1])
+        return kode
+
     # =====================================================================
     # HALAMAN 1: MENU UTAMA GUI (DASHBOARD AREA)
     # =====================================================================
@@ -303,7 +311,7 @@ class AplikasiPerpusTerintegrasi:
         tk.Button(frame_tombol, text="[2] CETAK STIKER LABEL BUKU MASSAL / IMPOR BARU\n(Layout A3+ Precision Kisscut)", font=("Arial", 11, "bold"), bg="#1a73e8", fg="white", width=45, height=2, command=self.tampilkan_layar_proses_cetak_buku).grid(row=1, column=0, pady=4)
         tk.Button(frame_tombol, text="[3] CETAK KARTU PERPUS DENGAN CEKLIS\n(Pilih Rombel & Pilih Siswa Secara Selektif)", font=("Arial", 11, "bold"), bg="#ff9900", fg="white", width=45, height=2, command=self.tampilkan_layar_setup_cetak_kartu).grid(row=2, column=0, pady=4)
         tk.Button(frame_tombol, text="[4] CETAK ULANG KARTU (REPRINT KOLEKTIF)\n(Cari via NISN - Maks 9 Siswa di A4 Landscape)", font=("Arial", 11, "bold"), bg="#6f42c1", fg="white", width=45, height=2, command=self.tampilkan_layar_cetak_satuan).grid(row=3, column=0, pady=4)
-        tk.Button(frame_tombol, text="[5] MODUL REKAP & LIVE ANALYTICS\n(Metrik Laporan Buku Paket & Buku Umum Fiksi)", font=("Arial", 11, "bold"), bg="#007afc", fg="white", width=45, height=2, command=self.tampilkan_layar_rekap).grid(row=4, column=0, pady=4)
+        tk.Button(frame_tombol, text="[5] MODUL REKAP & KONTROL PEMERATAAN BUKU\n(Matriks Ceklis Rombel, Rekap Buku, Ekspor Excel & PDF)", font=("Arial", 11, "bold"), bg="#007afc", fg="white", width=45, height=2, command=self.tampilkan_layar_rekap).grid(row=4, column=0, pady=4)
         
         tk.Button(
             frame_tombol, 
@@ -560,11 +568,11 @@ class AplikasiPerpusTerintegrasi:
 
             pesan_konfirmasi = (
                 f"⚠️ PERINGATAN KOREKSI DATA SINKRON!\n\n"
-                f"• ID Master Lama : {id_lama}\n"
-                f"• ID Master Baru : {id_baru}\n"
-                f"• Nama Terkoreksi: {nama_baru}\n"
-                f"• Rombel Baru    : {rombel_baru}\n\n"
-                f"Lanjutkan pembaruan dua tahap ke database perpustakaan?"
+                f"• Identitas Acuan Lama : {id_lama}\n"
+                f"• NISN / NIP Baru      : {id_baru}\n"
+                f"• Nama Terkoreksi      : {nama_baru}\n"
+                f"• Rombel Baru          : {rombel_baru}\n\n"
+                f"Lanjutkan pembaruan dua tahap ke master & seluruh log sirkulasi?"
             )
 
             if messagebox.askyesno("Konfirmasi Mutasi Data", pesan_konfirmasi, parent=top):
@@ -573,23 +581,49 @@ class AplikasiPerpusTerintegrasi:
                     cursor = conn.cursor()
                     cursor.execute("BEGIN TRANSACTION;")
 
+                    id_clean_lama = self.bersihkan_nisn_ke_string(id_lama)
+
+                    cursor.execute("""
+                        SELECT nama, nisn FROM data_siswa_perpus 
+                        WHERE nisn = ? OR (nisn LIKE ? AND ? != '') OR nama LIKE ?
+                        LIMIT 1
+                    """, (id_lama, f"%{id_clean_lama}%", id_clean_lama, f"%{id_lama}%"))
+                    row_master_lama = cursor.fetchone()
+                    
+                    nama_lama_db = row_master_lama[0] if row_master_lama else id_lama
+                    nisn_lama_db = row_master_lama[1] if row_master_lama else id_lama
+
                     cursor.execute("""
                         UPDATE data_siswa_perpus 
                         SET nisn = ?, nama = ?, rombel = ? 
-                        WHERE (nisn = ? OR nisn LIKE ?) AND nama = (SELECT nama FROM data_siswa_perpus WHERE (nisn = ? OR nisn LIKE ?) LIMIT 1)
-                    """, (id_baru, nama_baru, rombel_baru, id_lama, f"%{id_lama}%", id_lama, f"%{id_lama}%"))
+                        WHERE nisn = ? OR (nisn LIKE ? AND ? != '') OR nama LIKE ?
+                    """, (id_baru, nama_baru, rombel_baru, id_lama, f"%{id_clean_lama}%", id_clean_lama, f"%{id_lama}%"))
 
                     cursor.execute("""
                         UPDATE data_peminjaman_buku 
                         SET nisn = ?, nama_siswa = ?, rombel = ? 
-                        WHERE (nisn = ? OR nisn LIKE ?) AND nama_siswa = ?
-                    """, (id_baru, nama_baru, rombel_baru, id_lama, f"%{id_lama}%", nama_baru))
+                        WHERE nisn = ? 
+                           OR (nisn LIKE ? AND ? != '')
+                           OR nama_siswa = ? 
+                           OR nama_siswa = ?
+                           OR nama_siswa LIKE ?
+                    """, (id_baru, nama_baru, rombel_baru, id_lama, f"%{id_clean_lama}%", id_clean_lama, nama_lama_db, nisn_lama_db, f"%{id_lama}%"))
 
+                    baris_terdampak = cursor.rowcount
                     conn.commit()
                     conn.close()
 
                     self.jalankan_auto_backup_silent()
-                    messagebox.showinfo("Sukses Terkoreksi", "Data master dan log sirkulasi berhasil disinkronkan!", parent=top)
+                    if hasattr(self, 'df_rekap_log'):
+                        conn_ref = sqlite3.connect(DB_PATH)
+                        self.df_rekap_log = pd.read_sql_query("SELECT * FROM data_peminjaman_buku", conn_ref)
+                        conn_ref.close()
+
+                    messagebox.showinfo(
+                        "Sukses Terkoreksi", 
+                        f"Data master dan {baris_terdampak} log transaksi sirkulasi terkait berhasil disinkronkan!", 
+                        parent=top
+                    )
                     top.destroy()
 
                 except Exception as e:
@@ -625,7 +659,7 @@ class AplikasiPerpusTerintegrasi:
         btn_batal.pack(side=tk.RIGHT, padx=5)
 
     # =====================================================================
-    # HALAMAN 2: MODUL SIRKULASI TERINTEGRASI
+    # HALAMAN 2: MODUL SIRKULASI TERINTEGRASI (DENGAN PROTEKSI SESI & ANTI-MULTI-SCAN)
     # =====================================================================
     def tampilkan_layaran_sirkulasi(self):
         self.bersihkan_layar()
@@ -697,6 +731,18 @@ class AplikasiPerpusTerintegrasi:
         nisn_input = self.ent_nisn.get().strip()
         if not nisn_input: return
         
+        # PROTEKSI KETAT: Mencegah scan siswa baru jika sesi siswa sebelumnya belum di-commit/disimpan
+        if self.siswa_aktif is not None and len(self.daftar_buku_dijepit) > 0:
+            self.ent_nisn.delete(0, tk.END)
+            messagebox.showwarning(
+                "Sesi Belum Disimpan!", 
+                f"⚠️ PERINGATAN KETAT:\n\n"
+                f"Anda sedang memproses peminjaman untuk '{self.siswa_aktif['nama']}' "
+                f"dan masih ada {len(self.daftar_buku_dijepit)} buku dalam antrean yang BELUM DISIMPAN!\n\n"
+                f"Silakan klik tombol 'Simpan & Lanjut Peminjam Lain' terlebih dahulu."
+            )
+            return
+
         id_clean = self.bersihkan_nisn_ke_string(nisn_input)
         hasil = self.df_siswa[self.df_siswa['nisn'].apply(self.bersihkan_nisn_ke_string) == id_clean]
         
@@ -759,9 +805,36 @@ class AplikasiPerpusTerintegrasi:
         else:
             judul_terdeteksi = self.dapatkan_judul_buku(input_raw)
 
+        # PROTEKSI ANTI-MULTI-SCAN / DUPLIKASI DALAM SESI LOKAL
         if any(buku_id == id_final_buku for buku_id, _, _ in self.daftar_buku_dijepit):
-            messagebox.showwarning("Duplikasi", "Buku tersebut sudah di-scan di lembar ini.")
+            messagebox.showwarning("Duplikasi Sesi", f"Buku dengan kode '{id_final_buku}' sudah di-scan dalam daftar antrean peminjaman siswa ini.")
             return
+
+        # PROTEKSI DATABASE: Memastikan 1 kode satuan buku hanya bisa dipinjam 1 orang secara aktif
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            df_cek_db = pd.read_sql_query(
+                "SELECT nama_siswa, rombel FROM data_peminjaman_buku WHERE kode_satuan_buku = ? AND UPPER(status) = 'DIPINJAM'", 
+                conn, 
+                params=(id_final_buku,)
+            )
+            conn.close()
+            
+            if not df_cek_db.empty:
+                peminjam_lama = df_cek_db.iloc[0]['nama_siswa']
+                rombel_lama = df_cek_db.iloc[0]['rombel']
+                messagebox.showerror(
+                    "Buku Sedang Dipinjam Orang Lain!", 
+                    f"❌ TRANSAKSI DITOLAK OLEH SISTEM!\n\n"
+                    f"Buku dengan kode satuan '{id_final_buku}' ({judul_terdeteksi})\n"
+                    f"statusnya MASIH TERCATAT DIPINJAM oleh:\n\n"
+                    f"• Nama  : {peminjam_lama}\n"
+                    f"• Rombel: {rombel_lama}\n\n"
+                    f"Harap lakukan pengembalian buku terlebih dahulu sebelum meminjamkannya ke siswa lain."
+                )
+                return
+        except Exception as e:
+            print(f"Error pengecekan database: {e}")
 
         self.daftar_buku_dijepit.append((id_final_buku, judul_terdeteksi, input_raw))
         no_urut = len(self.daftar_buku_dijepit)
@@ -1084,17 +1157,16 @@ class AplikasiPerpusTerintegrasi:
         except Exception as e: messagebox.showerror("Error", f"{e}")
 
     # =====================================================================
-    # HALAMAN 5: MAHA DASHBOARD LIVE METRIK KEDUA DATABASE (SQLITE ENGINE)
+    # MODUL REKAP & LIVE ANALYTICS (ON-DEMAND SEARCH & AGREGASI KELOMPOK)
     # =====================================================================
     def tampilkan_layar_rekap(self):
         self.bersihkan_layar()
         
-        banner = tk.Label(self.root, text="MODUL REKAP SIRKULASI & LIVE ANALYTICS MASTER BUKU", font=("Arial", 14, "bold"), bg="#007afc", fg="white", pady=10)
+        banner = tk.Label(self.root, text="MODUL REKAP SIRKULASI & KONTROL PEMERATAAN BUKU", font=("Arial", 14, "bold"), bg="#007afc", fg="white", pady=10)
         banner.pack(fill=tk.X)
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
         cursor.execute("UPDATE data_peminjaman_buku SET nisn = TRIM(nisn), kode_satuan_buku = TRIM(kode_satuan_buku), status = TRIM(status)")
         cursor.execute('''
             DELETE FROM data_peminjaman_buku 
@@ -1108,230 +1180,332 @@ class AplikasiPerpusTerintegrasi:
         
         self.df_rekap_log = pd.read_sql_query("SELECT * FROM data_peminjaman_buku", conn)
         self.df_master_buku = pd.read_sql_query("SELECT * FROM qr_id_buku", conn)
-        self.df_master_umum = pd.read_sql_query("SELECT * FROM data_buku_umum", conn)
+        self.df_master_siswa = pd.read_sql_query("SELECT * FROM data_siswa_perpus", conn)
         conn.close()
-        
-        total_judul_10 = total_judul_11 = total_judul_12 = total_judul_umum = 0
-        total_eks_10 = total_eks_11 = total_eks_12 = total_eks_umum = total_eks_semua = 0
-        total_terpinjam = total_tersedia = 0
-        
-        if not self.df_master_buku.empty:
-            total_eks_semua += len(self.df_master_buku)
-            set_judul_10 = set(); set_judul_11 = set(); set_judul_12 = set()
-            for _, r in self.df_master_buku.iterrows():
-                kode_satuan = str(r['label_buku']).strip()
-                judul_real = self.dapatkan_judul_buku(kode_satuan).strip().upper()
-                if     kode_satuan.startswith("10"): total_eks_10 += 1; set_judul_10.add(judul_real)
-                elif   kode_satuan.startswith("11"): total_eks_11 += 1; set_judul_11.add(judul_real)
-                elif   kode_satuan.startswith("12"): total_eks_12 += 1; set_judul_12.add(judul_real)
-            total_judul_10 = len(set_judul_10); total_judul_11 = len(set_judul_11); total_judul_12 = len(set_judul_12)
-
-        dict_agregat_umum = {}
-        if not self.df_rekap_log.empty:
-            df_isbn_log = self.df_rekap_log[self.df_rekap_log['kode_satuan_buku'].str.contains("-") & 
-                                            (self.df_rekap_log['kode_satuan_buku'].str.startswith("978") | 
-                                             self.df_rekap_log['kode_satuan_buku'].str.startswith("979"))]
-            if not df_isbn_log.empty:
-                ids_fiksi_unik = df_isbn_log['kode_satuan_buku'].unique()
-                total_eks_umum = len(ids_fiksi_unik)
-                total_eks_semua += total_eks_umum
-                for id_f in ids_fiksi_unik:
-                    j_title = self.dapatkan_judul_buku(id_f).strip().upper()
-                    dict_agregat_umum[j_title] = dict_agregat_umum.get(j_title, 0) + 1
-                total_judul_umum = len(dict_agregat_umum)
-
-        if not self.df_rekap_log.empty:
-            df_active_pinjam = self.df_rekap_log[self.df_rekap_log['status'].str.upper() == 'DIPINJAM']
-            total_terpinjam = len(df_active_pinjam['kode_satuan_buku'].unique())
-            
-        total_tersedia = total_eks_semua - total_terpinjam
-        if total_tersedia < 0: total_tersedia = 0
-
-        frame_cards = tk.Frame(self.root, bg="#f4f6f9", pady=5)
-        frame_cards.pack(fill=tk.X, padx=15, pady=5)
-        
-        c1 = tk.Frame(frame_cards, bg="#eef4ff", bd=1, relief=tk.SOLID, padx=8, pady=5); c1.grid(row=0, column=0, padx=3, sticky="nsew")
-        tk.Label(c1, text="BUKU KELAS 10", font=("Arial", 9, "bold"), bg="#eef4ff", fg="#1a73e8").pack()
-        tk.Label(c1, text=f"{total_judul_10} Judul\n{total_eks_10} Eks", font=("Arial", 11, "bold"), bg="#eef4ff", fg="#202124").pack(pady=3)
-        
-        c2 = tk.Frame(frame_cards, bg="#efffaf", bd=1, relief=tk.SOLID, padx=8, pady=5); c2.grid(row=0, column=1, padx=3, sticky="nsew")
-        tk.Label(c2, text="BUKU KELAS 11", font=("Arial", 9, "bold"), bg="#efffaf", fg="#188038").pack()
-        tk.Label(c2, text=f"{total_judul_11} Judul\n{total_eks_11} Eks", font=("Arial", 11, "bold"), bg="#efffaf", fg="#202124").pack(pady=3)
-
-        c3 = tk.Frame(frame_cards, bg="#fff0f0", bd=1, relief=tk.SOLID, padx=8, pady=5); c3.grid(row=0, column=2, padx=3, sticky="nsew")
-        tk.Label(c3, text="BUKU KELAS 12", font=("Arial", 9, "bold"), bg="#fff0f0", fg="#c5221f").pack()
-        tk.Label(c3, text=f"{total_judul_12} Judul\n{total_eks_12} Eks", font=("Arial", 11, "bold"), bg="#fff0f0", fg="#202124").pack(pady=3)
-
-        c4 = tk.Frame(frame_cards, bg="#fef3d6", bd=1, relief=tk.SOLID, padx=8, pady=5); c4.grid(row=0, column=3, padx=3, sticky="nsew")
-        tk.Label(c4, text="NON-PAKET (FIKSI)", font=("Arial", 9, "bold"), bg="#fef3d6", fg="#b06000").pack()
-        tk.Label(c4, text=f"{total_judul_umum} Judul\n{total_eks_umum} Eks", font=("Arial", 11, "bold"), bg="#fef3d6", fg="#202124").pack(pady=3)
-
-        c5 = tk.Frame(frame_cards, bg="#e6fffa", bd=1, relief=tk.SOLID, padx=8, pady=5); c5.grid(row=0, column=4, padx=3, sticky="nsew")
-        tk.Label(c5, text="LIVE STATUS RAK", font=("Arial", 9, "bold"), bg="#e6fffa", fg="#008577").pack()
-        tk.Label(c5, text=f"Tersedia: {total_tersedia} E\nPinjam: {total_terpinjam} E", font=("Arial", 10, "bold"), bg="#e6fffa", fg="#202124").pack(pady=3)
-
-        c6 = tk.Frame(frame_cards, bg="#343a40", bd=1, relief=tk.SOLID, padx=8, pady=5); c6.grid(row=0, column=5, padx=3, sticky="nsew")
-        tk.Label(c6, text="TOTAL KESELURUH", font=("Arial", 9, "bold"), bg="#343a40", fg="white").pack()
-        tk.Label(c6, text=f"{total_eks_semua}\nEksemplar", font=("Arial", 11, "bold"), bg="#343a40", fg="#00ff00").pack(pady=3)
-        frame_cards.columnconfigure((0,1,2,3,4,5), weight=1)
 
         tab_lap = ttk.Notebook(self.root)
-        tab_per_rombel = tk.Frame(tab_lap, bg="#f4f6f9")
-        tab_stok_judul = tk.Frame(tab_lap, bg="#f4f6f9")
-        tab_lap.add(tab_per_rombel, text="  [1] TANGGUNGAN PINJAM SISWA PER ROMBEL  ")
-        tab_lap.add(tab_stok_judul, text="  [2] DAFTAR JUMLAH EKSEMPLAR PER JUDUL BUKU (ALL DATA)  ")
-        tab_lap.pack(expand=1, fill="both", padx=15, pady=5)
-
-        daftar_rombel = sorted(self.df_rekap_log['rombel'].dropna().unique()) if not self.df_rekap_log.empty else []
-        frame_filter = tk.Frame(tab_per_rombel, bg="#f4f6f9", pady=5); frame_filter.pack(fill=tk.X)
-        tk.Label(frame_filter, text="Pilih Rombel Kelas:", font=("Arial", 10, "bold"), bg="#f4f6f9").pack(side=tk.LEFT, padx=5)
-        self.cb_rombel = ttk.Combobox(frame_filter, values=daftar_rombel, state="readonly", font=("Arial", 10), width=18); self.cb_rombel.pack(side=tk.LEFT, padx=5); self.cb_rombel.bind("<<ComboboxSelected>>", self.proses_tampilkan_rekap_rombel)
+        tab_matriks_rombel = tk.Frame(tab_lap, bg="#f4f6f9")
+        tab_per_buku = tk.Frame(tab_lap, bg="#f4f6f9")
         
-        self.tree_rombel = ttk.Treeview(tab_per_rombel, columns=("NISN", "Nama", "Jumlah"), show="headings", height=8)
-        self.tree_rombel.heading("NISN", text="NISN"); self.tree_rombel.heading("Nama", text="Nama Lengkap Siswa"); self.tree_rombel.heading("Jumlah", text="Jumlah Buku Di Tangan")
-        self.tree_rombel.column("NISN", width=120, anchor=tk.CENTER); self.tree_rombel.column("Nama", width=420, anchor=tk.W); self.tree_rombel.column("Jumlah", width=200, anchor=tk.CENTER); self.tree_rombel.pack(fill=tk.BOTH, expand=True, pady=5)
+        tab_lap.add(tab_matriks_rombel, text="  [1] REKAP PER ROMBEL (CEKLIS KELENGKAPAN)  ")
+        tab_lap.add(tab_per_buku, text="  [2] REKAP PER BUKU (AGREGASI DISTRIBUSI KELOMPOK)  ")
+        tab_lap.pack(expand=1, fill="both", padx=15, pady=10)
 
-        tree_stok = ttk.Treeview(tab_stok_judul, columns=("No", "Jenis", "Judul", "TotalEks"), show="headings", height=9)
-        tree_stok.heading("No", text="No"); tree_stok.heading("Jenis", text="Kategori"); tree_stok.heading("Judul", text="Judul Buku Paket / Fiksi Master"); tree_stok.heading("TotalEks", text="Stok Eksemplar Terdaftar")
-        tree_stok.column("No", width=40, anchor=tk.CENTER); tree_stok.column("Jenis", width=100, anchor=tk.CENTER); tree_stok.column("Judul", width=450, anchor=tk.W); tree_stok.column("TotalEks", width=150, anchor=tk.CENTER); tree_stok.pack(fill=tk.BOTH, expand=True, pady=5)
+        # -----------------------------------------------------------------
+        # TAB 1: REKAP PER ROMBEL (MATRIKS CEKLIS BUKU PAKET)
+        # -----------------------------------------------------------------
+        daftar_rombel = sorted(self.df_master_siswa['rombel'].dropna().unique()) if not self.df_master_siswa.empty else []
         
-        dict_final_katalog = {}
-        if not self.df_master_buku.empty:
-            for _, r in self.df_master_buku.iterrows():
-                j_p = self.dapatkan_judul_buku(str(r['label_buku'])).strip().upper()
-                dict_final_katalog[j_p] = dict_final_katalog.get(j_p, {'Kategori': 'BUKU PAKET', 'Stok': 0})
-                dict_final_katalog[j_p]['Stok'] += 1
-        for j_u, val_stok in dict_agregat_umum.items():
-            dict_final_katalog[j_u] = {'Kategori': 'NON-PAKET', 'Stok': val_stok}
-            
-        idx_stok = 1
-        for key_j, data_b in sorted(dict_final_katalog.items()):
-            tree_stok.insert("", tk.END, values=(idx_stok, data_b['Kategori'], key_j, f"{data_b['Stok']} Eksemplar"))
-            idx_stok += 1
+        frame_fltr_rombel = tk.Frame(tab_matriks_rombel, bg="#f4f6f9", pady=5)
+        frame_fltr_rombel.pack(fill=tk.X)
+        
+        tk.Label(frame_fltr_rombel, text="Pilih Rombel Target:", font=("Arial", 10, "bold"), bg="#f4f6f9").pack(side=tk.LEFT, padx=5)
+        self.cb_rombel_matriks = ttk.Combobox(frame_fltr_rombel, values=daftar_rombel, state="readonly", font=("Arial", 10), width=18)
+        self.cb_rombel_matriks.pack(side=tk.LEFT, padx=5)
+        self.cb_rombel_matriks.bind("<<ComboboxSelected>>", self.muat_matriks_rekap_rombel)
+
+        frame_btn_exp_r = tk.Frame(frame_fltr_rombel, bg="#f4f6f9")
+        frame_btn_exp_r.pack(side=tk.RIGHT, padx=5)
+        
+        self.btn_exp_r_excel = tk.Button(frame_btn_exp_r, text="📊 Ekspor Excel", font=("Arial", 9, "bold"), bg="#188038", fg="white", state=tk.DISABLED, command=self.ekspor_matriks_rombel_excel)
+        self.btn_exp_r_excel.pack(side=tk.LEFT, padx=3)
+        self.btn_exp_r_pdf = tk.Button(frame_btn_exp_r, text="📄 Ekspor PDF", font=("Arial", 9, "bold"), bg="#d93025", fg="white", state=tk.DISABLED, command=self.ekspor_matriks_rombel_pdf)
+        self.btn_exp_r_pdf.pack(side=tk.LEFT, padx=3)
+
+        frame_tabel_m = tk.Frame(tab_matriks_rombel, bg="#f4f6f9")
+        frame_tabel_m.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.tree_matriks = ttk.Treeview(frame_tabel_m, show="headings", height=12)
+        scrollbar_m_y = ttk.Scrollbar(frame_tabel_m, orient="vertical", command=self.tree_matriks.yview)
+        scrollbar_m_x = ttk.Scrollbar(frame_tabel_m, orient="horizontal", command=self.tree_matriks.xview)
+        self.tree_matriks.configure(yscrollcommand=scrollbar_m_y.set, xscrollcommand=scrollbar_m_x.set)
+        
+        scrollbar_m_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_m_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree_matriks.pack(fill=tk.BOTH, expand=True)
+
+        # -----------------------------------------------------------------
+        # TAB 2: REKAP PER BUKU (DENGAN RINCIAN KODE SATUAN & ON-DEMAND)
+        # -----------------------------------------------------------------
+        frame_fltr_buku = tk.Frame(tab_per_buku, bg="#f4f6f9", pady=5)
+        frame_fltr_buku.pack(fill=tk.X)
+        
+        tk.Label(frame_fltr_buku, text="Cari Judul / Kode Induk:", font=("Arial", 10, "bold"), bg="#f4f6f9").pack(side=tk.LEFT, padx=5)
+        
+        self.ent_cari_buku_rekap = tk.Entry(frame_fltr_buku, font=("Arial", 10), width=30)
+        self.ent_cari_buku_rekap.pack(side=tk.LEFT, padx=5)
+        self.ent_cari_buku_rekap.bind("<Return>", self.muat_rekap_per_buku) # Hanya mencari saat Enter ditekan
+        
+        tk.Button(frame_fltr_buku, text="🔍 Cari Rekap", font=("Arial", 9, "bold"), bg="#5c6bc0", fg="white", command=self.muat_rekap_per_buku).pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_fltr_buku, text="Tampilkan Semua", font=("Arial", 9), bg="#e8eaed", command=self.reset_rekap_per_buku).pack(side=tk.LEFT, padx=5)
+
+        frame_btn_exp_b = tk.Frame(frame_fltr_buku, bg="#f4f6f9")
+        frame_btn_exp_b.pack(side=tk.RIGHT, padx=5)
+        
+        tk.Button(frame_btn_exp_b, text="📊 Ekspor Excel", font=("Arial", 9, "bold"), bg="#188038", fg="white", command=self.ekspor_per_buku_excel).pack(side=tk.LEFT, padx=3)
+        tk.Button(frame_btn_exp_b, text="📄 Ekspor PDF", font=("Arial", 9, "bold"), bg="#d93025", fg="white", command=self.ekspor_per_buku_pdf).pack(side=tk.LEFT, padx=3)
+        
+        frame_tabel_b = tk.Frame(tab_per_buku, bg="#f4f6f9")
+        frame_tabel_b.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.tree_per_buku = ttk.Treeview(frame_tabel_b, columns=("Kode", "Judul", "Rombel", "Siswa", "Satuan"), show="headings", height=12)
+        self.tree_per_buku.heading("Kode", text="Kelompok Kode Induk")
+        self.tree_per_buku.heading("Judul", text="Judul Buku")
+        self.tree_per_buku.heading("Rombel", text="Rombel")
+        self.tree_per_buku.heading("Siswa", text="Peminjam")
+        self.tree_per_buku.heading("Satuan", text="Daftar Kode Satuan Buku")
+        
+        self.tree_per_buku.column("Kode", width=130, anchor=tk.CENTER)
+        self.tree_per_buku.column("Judul", width=250, anchor=tk.W)
+        self.tree_per_buku.column("Rombel", width=80, anchor=tk.CENTER)
+        self.tree_per_buku.column("Siswa", width=180, anchor=tk.W)
+        self.tree_per_buku.column("Satuan", width=180, anchor=tk.W)
+        
+        sb_b_y = ttk.Scrollbar(frame_tabel_b, orient="vertical", command=self.tree_per_buku.yview)
+        self.tree_per_buku.configure(yscrollcommand=sb_b_y.set)
+        sb_b_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree_per_buku.pack(fill=tk.BOTH, expand=True)
+
+        self.muat_rekap_per_buku()
 
         frame_aksi = tk.Frame(self.root, bg="#f4f6f9", pady=5)
         frame_aksi.pack(fill=tk.X, padx=15)
-        self.btn_lihat_detil = tk.Button(frame_aksi, text="Tampilkan Detil Daftar Buku", font=("Arial", 11, "bold"), bg="#ff9900", fg="white", padx=15, pady=6, state=tk.DISABLED, command=self.pop_up_jendela_detil_buku)
-        self.btn_lihat_detil.pack(side=tk.RIGHT, padx=5)
-        tk.Button(frame_aksi, text="Ekspor Laporan Resmi (Excel)", font=("Arial", 11, "bold"), bg="#188038", fg="white", padx=15, pady=6, command=self.proses_ekspor_laporan_excel).pack(side=tk.RIGHT, padx=5)
         tk.Button(frame_aksi, text="Kembali ke Menu Utama", font=("Arial", 11), bg="#d93025", fg="white", padx=15, pady=6, command=self.tampilkan_menu_utama).pack(side=tk.LEFT)
 
-    def proses_tampilkan_rekap_rombel(self, event=None):
-        rombel_pilihan = self.cb_rombel.get()
-        for item in self.tree_rombel.get_children(): 
-            self.tree_rombel.delete(item)
+    def muat_matriks_rekap_rombel(self, event=None):
+        rombel_pilihan = self.cb_rombel_matriks.get()
+        if not rombel_pilihan: return
+        
+        df_siswa_rombel = self.df_master_siswa[self.df_master_siswa['rombel'] == rombel_pilihan].copy()
+        if df_siswa_rombel.empty:
+            messagebox.showinfo("Kosong", f"Tidak ada data siswa terdaftar di rombel {rombel_pilihan}")
+            self.btn_exp_r_excel.config(state=tk.DISABLED)
+            self.btn_exp_r_pdf.config(state=tk.DISABLED)
+            return
+
+        df_log_active = self.df_rekap_log[
+            (self.df_rekap_log['rombel'] == rombel_pilihan) & 
+            (self.df_rekap_log['status'].str.upper() == 'DIPINJAM')
+        ].copy()
+        
+        df_log_active['Judul_Buku'] = df_log_active['kode_satuan_buku'].apply(lambda x: self.dapatkan_judul_buku(str(x)).strip().upper())
+
+        daftar_judul_unik = sorted(list(df_log_active['Judul_Buku'].unique())) if not df_log_active.empty else []
+        
+        kolom_header = ["NISN", "Nama Siswa"] + daftar_judul_unik
+        self.tree_matriks.config(columns=kolom_header)
+        
+        for item in self.tree_matriks.get_children():
+            self.tree_matriks.delete(item)
+            
+        self.tree_matriks.heading("NISN", text="NISN")
+        self.tree_matriks.column("NISN", width=110, anchor=tk.CENTER)
+        self.tree_matriks.heading("Nama Siswa", text="Nama Lengkap Siswa")
+        self.tree_matriks.column("Nama Siswa", width=220, anchor=tk.W)
+        
+        for j_title in daftar_judul_unik:
+            self.tree_matriks.heading(j_title, text=j_title)
+            self.tree_matriks.column(j_title, width=150, anchor=tk.CENTER)
+            
+        self.data_matriks_export = []
+        for _, r_siswa in df_siswa_rombel.iterrows():
+            nisn = str(r_siswa['nisn']).split('.')[0].strip()
+            nama = str(r_siswa['nama']).upper()
+            nisn_clean = self.bersihkan_nisn_ke_string(nisn)
+            
+            row_vals = [nisn, nama]
+            for j_title in daftar_judul_unik:
+                has_book = False
+                if not df_log_active.empty:
+                    df_cek = df_log_active[
+                        (df_log_active['nisn'].apply(self.bersihkan_nisn_ke_string) == nisn_clean) & 
+                        (df_log_active['Judul_Buku'] == j_title)
+                    ]
+                    if not df_cek.empty:
+                        has_book = True
+                row_vals.append("✓" if has_book else "✗")
+                
+            self.tree_matriks.insert("", tk.END, values=row_vals)
+            self.data_matriks_export.append(row_vals)
+            
+        self.headers_matriks_export = kolom_header
+        self.btn_exp_r_excel.config(state=tk.NORMAL)
+        self.btn_exp_r_pdf.config(state=tk.NORMAL)
+
+    def reset_rekap_per_buku(self):
+        if hasattr(self, 'ent_cari_buku_rekap'):
+            self.ent_cari_buku_rekap.delete(0, tk.END)
+        self.muat_rekap_per_buku()
+
+    def muat_rekap_per_buku(self, event=None):
+        keyword = self.ent_cari_buku_rekap.get().strip().upper() if hasattr(self, 'ent_cari_buku_rekap') else ""
+        
+        for item in self.tree_per_buku.get_children():
+            self.tree_per_buku.delete(item)
             
         if self.df_rekap_log.empty: return
         
-        df_filtered = self.df_rekap_log[(self.df_rekap_log['rombel'].astype(str).str.strip() == rombel_pilihan) & 
-                                        (self.df_rekap_log['status'].astype(str).str.strip().str.upper() == 'DIPINJAM')].copy()
+        df_log_active = self.df_rekap_log[self.df_rekap_log['status'].str.upper() == 'DIPINJAM'].copy()
+        if df_log_active.empty: return
         
-        if df_filtered.empty: 
-            self.btn_lihat_detil.config(state=tk.DISABLED)
-            messagebox.showinfo("Bersih", f"Kelas {rombel_pilihan} tidak memiliki tanggungan peminjaman.")
-            return
+        df_log_active['Judul_Buku'] = df_log_active['kode_satuan_buku'].apply(lambda x: self.dapatkan_judul_buku(str(x)).strip().upper())
+        df_log_active['Kode_Induk'] = df_log_active['kode_satuan_buku'].apply(self.ekstrak_kode_induk)
         
-        df_filtered['nisn_clean'] = df_filtered['nisn'].apply(self.bersihkan_nisn_ke_string)
-        df_filtered['Judul_Buku'] = df_filtered['kode_satuan_buku'].apply(lambda x: self.dapatkan_judul_buku(str(x)).strip().upper())
-        
-        def is_valid_buku_rombel(row):
-            kode = str(row['kode_satuan_buku']).strip().upper()
-            rombel = str(row['rombel']).strip().upper()
+        if keyword:
+            df_log_active = df_log_active[
+                (df_log_active['Kode_Induk'].str.upper().str.contains(keyword)) | 
+                (df_log_active['Judul_Buku'].str.contains(keyword)) |
+                (df_log_active['nama_siswa'].str.upper().str.contains(keyword)) |
+                (df_log_active['rombel'].str.upper().str.contains(keyword)) |
+                (df_log_active['kode_satuan_buku'].str.upper().str.contains(keyword))
+            ]
             
-            if kode.startswith("978") or kode.startswith("979"):
-                return False
-
-            if "TJKT" in rombel or "TKJ" in rombel:
-                if any(x in kode for x in ["BISMEN", "MPLB", "AKL", "BD", "MP"]): 
-                    return False
-            elif "AKL" in rombel or "MPLB" in rombel:
-                if any(x in kode for x in ["TEKNO", "TJKT", "TKJ"]): 
-                    return False
-                if "MPLB" in rombel and "AKL" in kode: return False
-                if "AKL" in rombel and "MPLB" in kode: return False
-                
-            return True
-
-        df_filtered = df_filtered[df_filtered.apply(is_valid_buku_rombel, axis=1)]
-
-        df_clean = df_filtered.drop_duplicates(subset=['nisn_clean', 'Judul_Buku']).copy()
-        self.df_rombel_aktif_clean = df_clean
-        
-        df_agregat = df_clean.groupby(['nisn_clean', 'nisn', 'nama_siswa'])['Judul_Buku'].count().reset_index(name='Jumlah')
-        
-        for _, r in df_agregat.iterrows(): 
-            nisn_tampil = str(r['nisn']).split('.')[0].strip()
-            self.tree_rombel.insert("", tk.END, values=(nisn_tampil, r['nama_siswa'], f"{r['Jumlah']} Buku"))
+        df_agregat = df_log_active.groupby(['Kode_Induk', 'Judul_Buku', 'rombel', 'nama_siswa'])['kode_satuan_buku'].apply(lambda x: ", ".join(sorted(x.unique()))).reset_index(name='Daftar_Satuan')
+        df_agregat = df_agregat.sort_values(by=['Judul_Buku', 'rombel'])
             
-        self.btn_lihat_detil.config(state=tk.NORMAL)
+        self.data_per_buku_export = []
+        for _, r in df_agregat.iterrows():
+            row_data = [
+                r['Kode_Induk'],
+                r['Judul_Buku'],
+                r['rombel'],
+                r['nama_siswa'],
+                r['Daftar_Satuan']
+            ]
+            self.tree_per_buku.insert("", tk.END, values=row_data)
+            self.data_per_buku_export.append(row_data)
 
-    def pop_up_jendela_detil_buku(self):
-        selected_item = self.tree_rombel.selection()
-        if not selected_item:
-            messagebox.showwarning("Pilih Siswa", "Silakan pilih salah satu siswa dari tabel terlebih dahulu.")
+    # =====================================================================
+    # FITUR EKSPOR EXCEL & PDF KELENGKAPAN ROMBEL DAN REKAP BUKU
+    # =====================================================================
+    def ekspor_matriks_rombel_excel(self):
+        rombel = self.cb_rombel_matriks.get()
+        if not hasattr(self, 'data_matriks_export') or not self.data_matriks_export:
+            messagebox.showwarning("Kosong", "Tidak ada data matriks untuk diekspor.")
             return
             
-        item_data = self.tree_rombel.item(selected_item[0])['values']
-        raw_nisn_siswa = item_data[0]
-        nisn_clean_target = self.bersihkan_nisn_ke_string(raw_nisn_siswa)
-        nama_siswa = str(item_data[1])
-        
-        if self.df_rekap_log.empty:
-            messagebox.showwarning("Kosong", "Data log transaksi tidak tersedia.")
+        filename = os.path.join(DIR_PERPUS, f"Rekap_Matriks_Kelengkapan_{rombel}.xlsx")
+        try:
+            df = pd.DataFrame(self.data_matriks_export, columns=self.headers_matriks_export)
+            df.to_excel(filename, index=False)
+            messagebox.showinfo("Sukses", f"Berhasil mengekspor matriks {rombel} ke Excel:\n{filename}")
+            os.startfile(DIR_PERPUS)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal mengekspor Excel: {e}")
+
+    def ekspor_matriks_rombel_pdf(self):
+        rombel = self.cb_rombel_matriks.get()
+        if not hasattr(self, 'data_matriks_export') or not self.data_matriks_export:
+            messagebox.showwarning("Kosong", "Tidak ada data matriks untuk diekspor.")
             return
-
-        df_log_siswa = self.df_rekap_log.copy()
-        df_log_siswa['nisn_clean'] = df_log_siswa['nisn'].apply(self.bersihkan_nisn_ke_string)
-        
-        df_detil = df_log_siswa[(df_log_siswa['nisn_clean'] == nisn_clean_target) & 
-                                (df_log_siswa['status'].astype(str).str.strip().str.upper() == 'DIPINJAM')].copy()
-        
-        if not df_detil.empty:
-            df_detil['Judul_Buku'] = df_detil['kode_satuan_buku'].apply(lambda x: self.dapatkan_judul_buku(str(x)).strip().upper())
             
-            rombel_siswa = str(df_detil['rombel'].iloc[0]).upper()
-            df_detil = df_detil[~df_detil['kode_satuan_buku'].astype(str).str.upper().str.startswith(("978", "979"))]
+        filename = os.path.join(DIR_PERPUS, f"Rekap_Matriks_Kelengkapan_{rombel}.pdf")
+        try:
+            doc = SimpleDocTemplate(filename, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
+            elements = []
             
-            if "TJKT" in rombel_siswa or "TKJ" in rombel_siswa:
-                df_detil = df_detil[~df_detil['kode_satuan_buku'].astype(str).str.upper().str.contains("BISMEN|MPLB|AKL|BD|MP", regex=True)]
-            elif "MPLB" in rombel_siswa or "AKL" in rombel_siswa:
-                df_detil = df_detil[~df_detil['kode_satuan_buku'].astype(str).str.upper().str.contains("TEKNO|TJKT|TKJ", regex=True)]
-                if "MPLB" in rombel_siswa:
-                    df_detil = df_detil[~df_detil['kode_satuan_buku'].astype(str).str.upper().str.contains("AKL", regex=True)]
-                elif "AKL" in rombel_siswa:
-                    df_detil = df_detil[~df_detil['kode_satuan_buku'].astype(str).str.upper().str.contains("MPLB", regex=True)]
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=14, leading=16, alignment=1)
+            sub_style = ParagraphStyle('SubStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=10, leading=12, alignment=1)
+            cell_style = ParagraphStyle('Cell', parent=styles['Normal'], fontName='Helvetica', fontSize=7, leading=8)
+            cell_bold = ParagraphStyle('CellBold', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=7, leading=8)
 
-            df_detil = df_detil.drop_duplicates(subset=['Judul_Buku'])
+            elements.append(Paragraph(f"LAPORAN MATRIKS KELENGKAPAN BUKU PAKET", title_style))
+            elements.append(Paragraph(f"SMK WALISONGO JAKARTA - ROMBEL {rombel}", sub_style))
+            elements.append(Spacer(1, 10))
 
-        top = tk.Toplevel(self.root)
-        top.title(f"Detil Tanggungan Buku - {nama_siswa}")
-        top.geometry("720x420")
-        top.grab_set()
-        
-        tk.Label(top, text=f"DAFTAR BUKU DIPINJAM: {nama_siswa} (NISN: {raw_nisn_siswa})", font=("Arial", 11, "bold"), bg="#1a73e8", fg="white", pady=8).pack(fill=tk.X)
-        
-        tree_detil = ttk.Treeview(top, columns=("No", "Kode", "Judul", "TglPinjam"), show="headings")
-        tree_detil.heading("No", text="No")
-        tree_detil.heading("Kode", text="Kode Eksemplar")
-        tree_detil.heading("Judul", text="Judul Buku / Mata Pelajaran")
-        tree_detil.heading("TglPinjam", text="Tanggal Pinjam")
-        
-        tree_detil.column("No", width=40, anchor=tk.CENTER)
-        tree_detil.column("Kode", width=150, anchor=tk.CENTER)
-        tree_detil.column("Judul", width=360, anchor=tk.W)
-        tree_detil.column("TglPinjam", width=120, anchor=tk.CENTER)
-        tree_detil.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        if df_detil.empty:
-            tree_detil.insert("", tk.END, values=("-", "-", "TIDAK ADA TANGGUNGAN BUKU AKTIF", "-"))
-        else:
-            no = 1
-            for _, row in df_detil.iterrows():
-                tgl = str(row.get('tanggal_pinjam', '-'))[:10]
-                tree_detil.insert("", tk.END, values=(no, row['kode_satuan_buku'], row['Judul_Buku'], tgl))
-                no += 1
+            headers = [Paragraph(h, cell_bold) for h in self.headers_matriks_export]
+            data_table = [headers]
+
+            for row in self.data_matriks_export:
+                row_cells = []
+                for idx, val in enumerate(row):
+                    if idx >= 2:
+                        color = "green" if val == "✓" else "red"
+                        row_cells.append(Paragraph(f"<font color='{color}'><b>{val}</b></font>", cell_style))
+                    else:
+                        row_cells.append(Paragraph(str(val), cell_style))
+                data_table.append(row_cells)
+
+            t = Table(data_table, repeatRows=1)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#e8eaed")),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ALIGN', (2, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            elements.append(t)
+
+            doc.build(elements)
+            messagebox.showinfo("Sukses", f"Berhasil mencetak PDF matriks {rombel}:\n{filename}")
+            os.startfile(filename)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal mencetak PDF: {e}")
+
+    def ekspor_per_buku_excel(self):
+        if not hasattr(self, 'data_per_buku_export') or not self.data_per_buku_export:
+            messagebox.showwarning("Kosong", "Tidak ada data buku untuk diekspor.")
+            return
             
-        tk.Button(top, text="Tutup", font=("Arial", 10, "bold"), bg="#d93025", fg="white", command=top.destroy, padx=20, pady=5).pack(pady=10)
+        filename = os.path.join(DIR_PERPUS, f"Laporan_Distribusi_Peminjaman_Buku.xlsx")
+        try:
+            df = pd.DataFrame(self.data_per_buku_export, columns=["Kelompok Kode Induk", "Judul Buku", "Rombel", "Nama Siswa Peminjam", "Daftar Kode Satuan Buku"])
+            df.to_excel(filename, index=False)
+            messagebox.showinfo("Sukses", f"Berhasil mengekspor Laporan Distribusi Buku ke Excel:\n{filename}")
+            os.startfile(DIR_PERPUS)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal mengekspor Excel: {e}")
+
+    def ekspor_per_buku_pdf(self):
+        if not hasattr(self, 'data_per_buku_export') or not self.data_per_buku_export:
+            messagebox.showwarning("Kosong", "Tidak ada data buku untuk diekspor.")
+            return
+            
+        filename = os.path.join(DIR_PERPUS, f"Laporan_Distribusi_Peminjaman_Buku.pdf")
+        try:
+            doc = SimpleDocTemplate(filename, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
+            elements = []
+            
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=13, leading=15, alignment=1)
+            sub_style = ParagraphStyle('SubStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=11, alignment=1)
+            cell_style = ParagraphStyle('Cell', parent=styles['Normal'], fontName='Helvetica', fontSize=8, leading=10)
+            cell_bold = ParagraphStyle('CellBold', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, leading=10)
+
+            elements.append(Paragraph("LAPORAN DISTRIBUSI PEMINJAMAN BUKU PERPUSTAKAAN", title_style))
+            elements.append(Paragraph("SMK WALISONGO JAKARTA", sub_style))
+            elements.append(Spacer(1, 10))
+
+            headers = [
+                Paragraph("Kelompok Kode Induk", cell_bold), Paragraph("Judul Buku", cell_bold),
+                Paragraph("Rombel", cell_bold), Paragraph("Nama Siswa Peminjam", cell_bold), Paragraph("Daftar Kode Satuan Buku", cell_bold)
+            ]
+            data_table = [headers]
+
+            for row in self.data_per_buku_export:
+                data_table.append([
+                    Paragraph(str(row[0]), cell_style), Paragraph(str(row[1]), cell_style),
+                    Paragraph(str(row[2]), cell_style), Paragraph(str(row[3]), cell_style),
+                    Paragraph(str(row[4]), cell_style)
+                ])
+
+            t = Table(data_table, colWidths=[110, 220, 70, 160, 210], repeatRows=1)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#e8eaed")),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ]))
+            elements.append(t)
+
+            doc.build(elements)
+            messagebox.showinfo("Sukses", f"Berhasil mencetak PDF Laporan Distribusi Buku:\n{filename}")
+            os.startfile(filename)
+        except Exception as e:
+            messagebox.showerror("Error", f"Gagal mencetak PDF: {e}")
 
     # =====================================================================
     # UTILITAS PROSES BACKGROUND MASSAL LABEL KISSCUT A3+ (DENGAN OPSI IMPOR)
